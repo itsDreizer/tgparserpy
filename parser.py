@@ -1,5 +1,6 @@
 import asyncio
 import os
+import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from collections import defaultdict
@@ -45,8 +46,8 @@ SOURCE_CHANNELS = [
     "kaliningrad_online",
 ]
 
-COPY_MODE = False          # False = forward, True = copy
-THROTTLE_SECONDS = 2       # задержка между постами
+COPY_MODE = False          # False = пересылка, True = копирование
+THROTTLE_SECONDS = 2       # задержка между постами (сек)
 
 client = TelegramClient(SESSION, api_id, api_hash)
 
@@ -57,119 +58,145 @@ post_queue = asyncio.Queue()
 albums = defaultdict(list)
 
 
-# ================== LOG ==================
+# ================== ЛОГ ==================
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-# ================== SETUP ==================
+# ================== AI АНАЛИЗ ==================
+def analyze_post_with_ai(text: str):
+    if not text:
+        return
+
+    
+    
+    try:
+        description = "Это пост"
+        payload = {
+            "model": "gemma3:1b",
+            "prompt": (
+                f"Проанализируй пост и верни true в случае если он подходит под описание фильтрации, либо false если же нет. Вот описание: {description}"
+                f"{text}"
+            ),
+            "stream": False,
+            "think": False
+        }
+
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        ai_response = data.get("response")
+
+        return ai_response == "true"
+
+    except Exception as e:
+        log(f"❌ Ошибка запроса к нейросети: {repr(e)}")
+
+
+# ================== ИНИЦИАЛИЗАЦИЯ ==================
 async def warmup():
     dialogs = await client.get_dialogs(limit=500)
-    log(f"[warmup] dialogs loaded: {len(dialogs)}")
+    log(f"Прогрев клиента: загружено диалогов — {len(dialogs)}")
 
 
 async def resolve_sources():
     for ch in SOURCE_CHANNELS:
         try:
             entity = await client.get_entity(ch)
-
-            # Приводим username → peer_id (-100...)
             peer_id = entity.id if entity.id < 0 else int(f"-100{entity.id}")
             source_ids.add(peer_id)
-
-            log(f"[source OK] {entity.title} → peer_id={peer_id}")
-
+            log(f"Источник добавлен: {entity.title} (peer_id={peer_id})")
         except Exception as e:
-            log(f"[source SKIP] {ch}: {e}")
+            log(f"Источник пропущен: {ch} — {e}")
 
-    log(f"[DEBUG] source_ids = {source_ids}")
+    log(f"Всего источников подключено: {len(source_ids)}")
 
 
 async def resolve_target():
     global target_id
     entity = await client.get_entity(TARGET_CHANNEL)
     target_id = entity.id
-    log(f"[target OK] {entity.title} ({target_id})")
+    log(f"Целевой канал: {entity.title} ({target_id})")
 
 
-async def send_test_message():
-    await client.send_message(
-        TARGET_CHANNEL,
-        "✅ Listener запущен и готов пересылать посты"
-    )
-    log("[test] Test message sent")
-
-
-# ================== HANDLER ==================
+# ================== ОБРАБОТЧИК ==================
 @client.on(events.NewMessage)
 async def handler(event):
-    log(
-        f"[event] chat_id={event.chat_id} "
-        f"msg_id={event.message.id} "
-        f"post={event.message.post} "
-        f"grouped_id={event.message.grouped_id}"
-    )
-
     if event.chat_id not in source_ids:
-        log("[skip] not in source_ids")
         return
 
     msg = event.message
 
     if not msg.post:
-        log("[skip] not a channel post")
+        log("Сообщение пропущено: не является постом канала")
         return
 
-    # ===== ALBUM =====
+    # ===== АЛЬБОМ =====
     if msg.grouped_id:
         albums[msg.grouped_id].append(msg)
         log(
-            f"[album] add msg {msg.id} "
-            f"group={msg.grouped_id} "
-            f"size={len(albums[msg.grouped_id])}"
+            f"Альбом: добавлено сообщение {msg.id} "
+            f"(группа {msg.grouped_id}, всего {len(albums[msg.grouped_id])})"
         )
 
         await asyncio.sleep(1)
 
         if msg.grouped_id in albums:
             messages = albums.pop(msg.grouped_id)
+
+            isFiltered = await analyze_post_with_ai(messages[0].text)
+            
+            if not isFiltered:
+                return
+            
             await post_queue.put(messages)
             log(
-                f"[album] finalized group {msg.grouped_id}, "
-                f"{len(messages)} msgs → queue"
+                f"Альбом собран: {len(messages)} элементов "
+                f"→ добавлено в очередь"
             )
+
     else:
+        isFiltered = await analyze_post_with_ai(msg.text)
+        if not isFiltered:
+            return
+        
         await post_queue.put([msg])
-        log(f"[queue] single msg {msg.id} added")
+        log(f"Одиночный пост {msg.id} добавлен в очередь")
 
 
-# ================== SENDER ==================
+# ================== ОТПРАВЩИК ==================
 async def sender_worker():
-    log("[worker] sender worker started")
+    log("Воркер отправки запущен")
 
     while True:
         messages = await post_queue.get()
-        log(f"[worker] got post from queue ({len(messages)} msgs)")
+        log(f"Из очереди получен пост ({len(messages)} элементов)")
 
         try:
             if COPY_MODE:
-                log("[send] COPY_MODE")
+                log("Режим: копирование сообщения")
                 await client.send_message(
                     TARGET_CHANNEL,
                     messages[0].text,
                     file=[m.media for m in messages if m.media]
                 )
             else:
-                log("[send] FORWARD_MODE")
+                log("Режим: пересылка сообщения")
                 await client.forward_messages(
                     TARGET_CHANNEL,
                     messages
                 )
 
-            log("[send OK] post sent")
+            log("Пост успешно отправлен")
 
         except Exception as e:
-            log(f"[SEND ERROR] {repr(e)}")
+            log(f"Ошибка при отправке поста: {repr(e)}")
 
         await asyncio.sleep(THROTTLE_SECONDS)
         post_queue.task_done()
@@ -178,16 +205,15 @@ async def sender_worker():
 # ================== MAIN ==================
 async def main():
     await client.start()
-    log("[+] Client started")
+    log("Клиент Telegram запущен")
 
     await warmup()
     await resolve_target()
     await resolve_sources()
-    await send_test_message()
 
     asyncio.create_task(sender_worker())
 
-    log("[+] Listener is running")
+    log("Listener запущен и ожидает новые посты")
     await client.run_until_disconnected()
 
 
