@@ -6,11 +6,16 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime
 
+import cohere
+
+
 # ================== LOAD ENV ==================
 load_dotenv()
 
 api_id = int(os.getenv("TG_API_ID"))
 api_hash = os.getenv("TG_API_HASH")
+ai_api_key = os.getenv("AI_API_KEY")
+ai = cohere.ClientV2(api_key=ai_api_key)
 SESSION = os.getenv("TG_SESSION", "tg_listener")
 TARGET_CHANNEL = os.getenv("TG_TARGET_CHANNEL")
 # ==============================================
@@ -64,39 +69,72 @@ def log(msg):
 
 
 # ================== AI АНАЛИЗ ==================
-def analyze_post_with_ai(text: str):
-    if not text:
-        return
+def analyze_post_with_ai(text: str) -> bool:
+    if not text or not text.strip():
+        return False
 
-    
-    
+    prompt = f"""
+Ты — система фильтрации контента.
+
+Твоя задача:
+Определить, соответствует ли текст поста указанному правилу.
+
+Правило фильтрации:
+Пост соответствует правилу, если в нём описывается происшествие
+(инцидент, чрезвычайная ситуация, конфликт, преступление, авария
+или иное нештатное событие), которое:
+
+— либо непосредственно связано с действиями, бездействием или
+участием военных или государственных силовых структур Российской
+Федерации (СК, Росгвардия, МВД, Министерство обороны РФ,
+Вооружённые силы РФ и др.) либо их сотрудников;
+
+— либо произошло на территории, объектах или в учреждениях,
+относящихся к военным или государственным силовым структурам РФ,
+включая воинские части, военные базы, казармы, полигоны,
+объекты Минобороны РФ, ведомственные здания и охраняемые объекты.
+
+К происшествиям относятся, в том числе:
+нападения, задержания, стрельба, взрывы, аварии, гибель или ранения
+людей, нарушения техники безопасности, чрезвычайные ситуации,
+уголовные инциденты, конфликты и иные нештатные события.
+
+НЕ считается соответствием правилу, если государственные или
+силовые структуры лишь:
+- проводят проверку
+- принимают материалы
+- дают комментарии
+- расследуют бытовые, трудовые или гражданские происшествия,
+  не связанные с их деятельностью или территорией.
+
+Текст поста:
+{text}
+
+Инструкция:
+- Верни ТОЛЬКО одно значение: true или false
+- true — если текст соответствует правилу
+- false — если не соответствует
+- Не объясняй решение
+- Не добавляй никакого текста кроме true или false
+""".strip()
+
     try:
-        description = "Это пост"
-        payload = {
-            "model": "gemma3:1b",
-            "prompt": (
-                f"Проанализируй пост и верни true в случае если он подходит под описание фильтрации, либо false если же нет. Вот описание: {description}"
-                f"{text}"
-            ),
-            "stream": False,
-            "think": False
-        }
-
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json=payload,
-            timeout=30
+        response = ai.chat(
+            model="command-a-03-2025",
+            messages=[{"role": "user", "content": prompt}],
         )
 
-        response.raise_for_status()
-        data = response.json()
+        content = response.message.content
 
-        ai_response = data.get("response")
+        if not content or not hasattr(content[0], "text"):
+            return False
 
-        return ai_response == "true"
+        result = content[0].text.strip().lower()
+        return result == "true"
 
     except Exception as e:
         log(f"❌ Ошибка запроса к нейросети: {repr(e)}")
+        return False
 
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
@@ -150,7 +188,7 @@ async def handler(event):
         if msg.grouped_id in albums:
             messages = albums.pop(msg.grouped_id)
 
-            isFiltered = await analyze_post_with_ai(messages[0].text)
+            isFiltered = analyze_post_with_ai(messages[0].text)
             
             if not isFiltered:
                 return
@@ -162,7 +200,7 @@ async def handler(event):
             )
 
     else:
-        isFiltered = await analyze_post_with_ai(msg.text)
+        isFiltered = analyze_post_with_ai(msg.text)
         if not isFiltered:
             return
         
