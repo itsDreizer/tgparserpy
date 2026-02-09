@@ -4,8 +4,7 @@ from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime
-
-import cohere
+import requests
 
 
 # ================== LOAD ENV ==================
@@ -14,7 +13,7 @@ load_dotenv()
 api_id = int(os.getenv("TG_API_ID"))
 api_hash = os.getenv("TG_API_HASH")
 ai_api_key = os.getenv("AI_API_KEY")
-ai = cohere.ClientV2(api_key=ai_api_key)
+
 SESSION = os.getenv("TG_SESSION", "tg_listener")
 TARGET_CHANNEL = os.getenv("TG_TARGET_CHANNEL")
 # ==============================================
@@ -48,10 +47,11 @@ SOURCE_CHANNELS = [
     "Kaliningrad_life",
     "glavche",
     "kaliningrad_online",
+    "Kalina39info"
 ]
 
 COPY_MODE = False          # False = пересылка, True = копирование
-THROTTLE_SECONDS = 2       # задержка между постами (сек)
+THROTTLE_SECONDS = 35      # задержка между постами (сек)
 
 client = TelegramClient(SESSION, api_id, api_hash)
 
@@ -70,6 +70,10 @@ def log(msg):
 # ================== AI АНАЛИЗ ==================
 def analyze_post_with_ai(text: str) -> bool:
     if not text or not text.strip():
+        return False
+
+    if not ai_api_key:
+        log("❌ AI_API_KEY не задан")
         return False
 
     prompt = f"""
@@ -118,23 +122,27 @@ def analyze_post_with_ai(text: str) -> bool:
 """.strip()
 
     try:
-        response = ai.chat(
-            model="command-a-03-2025",
-            messages=[{"role": "user", "content": prompt}],
+        response = requests.post(
+            "https://apifreellm.com/api/v1/chat",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {ai_api_key}"
+            },
+            json={"message": prompt}
         )
 
-        content = response.message.content
-
-        if not content or not hasattr(content[0], "text"):
+        if response.status_code != 200:
+            log(f"❌ Ошибка AI API: {response.status_code} {response.text}")
             return False
 
-        result = content[0].text.strip().lower()
+        data = response.json()
+        content = data.get("response") or data.get("message") or ""
+        result = content.strip().lower()
         return result == "true"
 
     except Exception as e:
         log(f"❌ Ошибка запроса к нейросети: {repr(e)}")
         return False
-
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 async def warmup():
