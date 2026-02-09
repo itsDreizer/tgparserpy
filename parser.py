@@ -36,7 +36,6 @@ client = TelegramClient(SESSION, api_id, api_hash)
 source_ids = set()
 target_id = None
 
-# Очереди
 ai_queue = asyncio.Queue()
 post_queue = asyncio.Queue()
 
@@ -79,12 +78,24 @@ async def analyze_post_with_ai(text: str) -> bool:
         )
 
         if response.status_code != 200:
-            log(f"❌ AI API ошибка: {response.status_code}")
+            log(f"❌ AI API HTTP ошибка: {response.status_code}")
             return False
 
         data = response.json()
-        content = data.get("response") or data.get("message") or ""
-        return content.strip().lower() == "true"
+
+        # --- НОВАЯ ЛОГИКА ---
+        if not data.get("success"):
+            log("❌ AI API success = false")
+            return False
+
+        result = str(data.get("response", "")).strip().lower()
+
+        # учитываем задержку free-tier если есть
+        delay = data.get("features", {}).get("delaySeconds")
+        if delay:
+            await asyncio.sleep(delay)
+
+        return result == "true"
 
     except Exception as e:
         log(f"❌ AI ошибка: {repr(e)}")
@@ -124,10 +135,8 @@ async def handler(event):
     if not msg.post:
         return
 
-    # ===== Альбом =====
     if msg.grouped_id:
         albums[msg.grouped_id].append(msg)
-
         await asyncio.sleep(1)
 
         if msg.grouped_id in albums:
