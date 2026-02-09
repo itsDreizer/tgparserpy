@@ -15,6 +15,7 @@ ai_api_key = os.getenv("AI_API_KEY")
 
 SESSION = os.getenv("TG_SESSION", "tg_listener")
 TARGET_CHANNEL = os.getenv("TG_TARGET_CHANNEL")
+
 # ==============================================
 
 SOURCE_CHANNELS = [
@@ -27,15 +28,18 @@ SOURCE_CHANNELS = [
     "Kalina39info"
 ]
 
-COPY_MODE = False          # False = пересылка, True = копирование
-THROTTLE_SECONDS = 10      # задержка между постами (сек) и запросами к AI
+COPY_MODE = False
+THROTTLE_SECONDS = 10
 
 client = TelegramClient(SESSION, api_id, api_hash)
 
 source_ids = set()
 target_id = None
 
+# Очереди
+ai_queue = asyncio.Queue()
 post_queue = asyncio.Queue()
+
 albums = defaultdict(list)
 
 # ================== ЛОГ ==================
@@ -43,10 +47,7 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ================== AI АНАЛИЗ ==================
-_last_ai_call = 0  # время последнего запроса к AI
-
 async def analyze_post_with_ai(text: str) -> bool:
-    global _last_ai_call
     if not text or not text.strip():
         return False
 
@@ -54,55 +55,16 @@ async def analyze_post_with_ai(text: str) -> bool:
         log("❌ AI_API_KEY не задан")
         return False
 
-    # Ждем, если прошло меньше THROTTLE_SECONDS с последнего запроса
-    now = datetime.now().timestamp()
-    wait_time = THROTTLE_SECONDS - (now - _last_ai_call)
-    if wait_time > 0:
-        await asyncio.sleep(wait_time)
-
     prompt = f"""
 Ты — система фильтрации контента.
 
-Твоя задача:
-Определить, соответствует ли текст поста указанному правилу.
+Определи, соответствует ли текст происшествию,
+связанному с военными или силовыми структурами РФ.
 
-Правило фильтрации:
-Пост соответствует правилу, если в нём описывается происшествие
-(инцидент, чрезвычайная ситуация, конфликт, преступление, авария
-или иное нештатное событие), которое:
+Верни ТОЛЬКО true или false.
 
-— либо непосредственно связано с действиями, бездействием или
-участием военных или государственных силовых структур Российской
-Федерации (СК, Росгвардия, МВД, Министерство обороны РФ,
-Вооружённые силы РФ и др.) либо их сотрудников;
-
-— либо произошло на территории, объектах или в учреждениях,
-относящихся к военным или государственным силовым структурам РФ,
-включая воинские части, военные базы, казармы, полигоны,
-объекты Минобороны РФ, ведомственные здания и охраняемые объекты.
-
-К происшествиям относятся, в том числе:
-нападения, задержания, стрельба, взрывы, аварии, гибель или ранения
-людей, нарушения техники безопасности, чрезвычайные ситуации,
-уголовные инциденты, конфликты и иные нештатные события.
-
-НЕ считается соответствием правилу, если государственные или
-силовые структуры лишь:
-- проводят проверку
-- принимают материалы
-- дают комментарии
-- расследуют бытовые, трудовые или гражданские происшествия,
-  не связанные с их деятельностью или территорией.
-
-Текст поста:
+Текст:
 {text}
-
-Инструкция:
-- Верни ТОЛЬКО одно значение: true или false
-- true — если текст соответствует правилу
-- false — если не соответствует
-- Не объясняй решение
-- Не добавляй никакого текста кроме true или false
 """.strip()
 
     try:
@@ -112,32 +74,26 @@ async def analyze_post_with_ai(text: str) -> bool:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {ai_api_key}"
             },
-            json={"message": prompt}
+            json={"message": prompt},
+            timeout=60
         )
 
-        _last_ai_call = datetime.now().timestamp()  # обновляем время последнего запроса
-
         if response.status_code != 200:
-            log(f"❌ Ошибка AI API: {response.status_code} {response.text}")
+            log(f"❌ AI API ошибка: {response.status_code}")
             return False
 
         data = response.json()
         content = data.get("response") or data.get("message") or ""
-        result = content.strip().lower()
-
-        # Пауза после запроса к AI, чтобы не перегружать API
-        await asyncio.sleep(THROTTLE_SECONDS)
-
-        return result == "true"
+        return content.strip().lower() == "true"
 
     except Exception as e:
-        log(f"❌ Ошибка запроса к нейросети: {repr(e)}")
+        log(f"❌ AI ошибка: {repr(e)}")
         return False
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 async def warmup():
     dialogs = await client.get_dialogs(limit=500)
-    log(f"Прогрев клиента: загружено диалогов — {len(dialogs)}")
+    log(f"Прогрев: загружено диалогов — {len(dialogs)}")
 
 async def resolve_sources():
     for ch in SOURCE_CHANNELS:
@@ -145,17 +101,17 @@ async def resolve_sources():
             entity = await client.get_entity(ch)
             peer_id = entity.id if entity.id < 0 else int(f"-100{entity.id}")
             source_ids.add(peer_id)
-            log(f"Источник добавлен: {entity.title} (peer_id={peer_id})")
+            log(f"Источник: {entity.title}")
         except Exception as e:
             log(f"Источник пропущен: {ch} — {e}")
 
-    log(f"Всего источников подключено: {len(source_ids)}")
+    log(f"Всего источников: {len(source_ids)}")
 
 async def resolve_target():
     global target_id
     entity = await client.get_entity(TARGET_CHANNEL)
     target_id = entity.id
-    log(f"Целевой канал: {entity.title} ({target_id})")
+    log(f"Целевой канал: {entity.title}")
 
 # ================== ОБРАБОТЧИК ==================
 @client.on(events.NewMessage)
@@ -166,68 +122,69 @@ async def handler(event):
     msg = event.message
 
     if not msg.post:
-        log("Сообщение пропущено: не является постом канала")
         return
 
-    # ===== АЛЬБОМ =====
+    # ===== Альбом =====
     if msg.grouped_id:
         albums[msg.grouped_id].append(msg)
-        log(
-            f"Альбом: добавлено сообщение {msg.id} "
-            f"(группа {msg.grouped_id}, всего {len(albums[msg.grouped_id])})"
-        )
 
         await asyncio.sleep(1)
 
         if msg.grouped_id in albums:
             messages = albums.pop(msg.grouped_id)
-
-            isFiltered = await analyze_post_with_ai(messages[0].text)
-            
-            if not isFiltered:
-                return
-            
-            await post_queue.put(messages)
-            log(
-                f"Альбом собран: {len(messages)} элементов "
-                f"→ добавлено в очередь"
-            )
-
+            await ai_queue.put(messages)
+            log(f"Альбом добавлен в AI очередь ({len(messages)} элементов)")
     else:
-        isFiltered = await analyze_post_with_ai(msg.text)
-        if not isFiltered:
-            return
-        
-        await post_queue.put([msg])
-        log(f"Одиночный пост {msg.id} добавлен в очередь")
+        await ai_queue.put([msg])
+        log(f"Пост {msg.id} добавлен в AI очередь")
 
-# ================== ОТПРАВЩИК ==================
+# ================== AI WORKER ==================
+async def ai_worker():
+    log("AI воркер запущен")
+
+    while True:
+        messages = await ai_queue.get()
+
+        try:
+            log("AI анализирует пост...")
+            is_filtered = await analyze_post_with_ai(messages[0].text)
+
+            if is_filtered:
+                await post_queue.put(messages)
+                log("Пост прошёл фильтр → в очередь отправки")
+            else:
+                log("Пост не прошёл фильтр")
+
+        except Exception as e:
+            log(f"Ошибка AI воркера: {repr(e)}")
+
+        await asyncio.sleep(THROTTLE_SECONDS)
+        ai_queue.task_done()
+
+# ================== SENDER WORKER ==================
 async def sender_worker():
     log("Воркер отправки запущен")
 
     while True:
         messages = await post_queue.get()
-        log(f"Из очереди получен пост ({len(messages)} элементов)")
 
         try:
             if COPY_MODE:
-                log("Режим: копирование сообщения")
                 await client.send_message(
                     TARGET_CHANNEL,
                     messages[0].text,
                     file=[m.media for m in messages if m.media]
                 )
             else:
-                log("Режим: пересылка сообщения")
                 await client.forward_messages(
                     TARGET_CHANNEL,
                     messages
                 )
 
-            log("Пост успешно отправлен")
+            log("Пост отправлен")
 
         except Exception as e:
-            log(f"Ошибка при отправке поста: {repr(e)}")
+            log(f"Ошибка отправки: {repr(e)}")
 
         await asyncio.sleep(THROTTLE_SECONDS)
         post_queue.task_done()
@@ -235,15 +192,16 @@ async def sender_worker():
 # ================== MAIN ==================
 async def main():
     await client.start()
-    log("Клиент Telegram запущен")
+    log("Telegram клиент запущен")
 
     await warmup()
     await resolve_target()
     await resolve_sources()
 
+    asyncio.create_task(ai_worker())
     asyncio.create_task(sender_worker())
 
-    log("Listener запущен и ожидает новые посты")
+    log("Система запущена и ожидает посты")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
