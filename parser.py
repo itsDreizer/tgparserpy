@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime
 import requests
+from requests.exceptions import ReadTimeout
 
 # ================== LOAD ENV ==================
 load_dotenv()
@@ -30,6 +31,9 @@ SOURCE_CHANNELS = [
 
 COPY_MODE = False
 THROTTLE_SECONDS = 10
+
+MAX_RETRIES = 5
+RETRY_DELAY = 10  # секунд
 
 client = TelegramClient(SESSION, api_id, api_hash)
 
@@ -66,40 +70,51 @@ async def analyze_post_with_ai(text: str) -> bool:
 {text}
 """.strip()
 
-    try:
-        response = requests.post(
-            "https://apifreellm.com/api/v1/chat",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {ai_api_key}"
-            },
-            json={"message": prompt},
-            timeout=60
-        )
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            log(f"AI запрос попытка {attempt}/{MAX_RETRIES}")
 
-        if response.status_code != 200:
-            log(f"❌ AI API HTTP ошибка: {response.status_code}")
+            response = requests.post(
+                "https://apifreellm.com/api/v1/chat",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {ai_api_key}"
+                },
+                json={"message": prompt},
+                timeout=60
+            )
+
+            if response.status_code != 200:
+                log(f"❌ AI API HTTP ошибка: {response.status_code}")
+                return False
+
+            data = response.json()
+
+            if not data.get("success"):
+                log("❌ AI API success = false")
+                return False
+
+            result = str(data.get("response", "")).strip().lower()
+
+            delay = data.get("features", {}).get("delaySeconds")
+            if delay:
+                await asyncio.sleep(delay)
+
+            return result == "true"
+
+        except ReadTimeout:
+            log(f"⏳ Таймаут AI (попытка {attempt})")
+
+            if attempt < MAX_RETRIES:
+                log(f"Повтор через {RETRY_DELAY} сек...")
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                log("❌ AI запрос окончательно упал по таймауту")
+                return False
+
+        except Exception as e:
+            log(f"❌ AI ошибка: {repr(e)}")
             return False
-
-        data = response.json()
-
-        # --- НОВАЯ ЛОГИКА ---
-        if not data.get("success"):
-            log("❌ AI API success = false")
-            return False
-
-        result = str(data.get("response", "")).strip().lower()
-
-        # учитываем задержку free-tier если есть
-        delay = data.get("features", {}).get("delaySeconds")
-        if delay:
-            await asyncio.sleep(delay)
-
-        return result == "true"
-
-    except Exception as e:
-        log(f"❌ AI ошибка: {repr(e)}")
-        return False
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 async def warmup():
